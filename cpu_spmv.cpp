@@ -62,7 +62,13 @@
 
 #include "sparse_matrix.h"
 #include "utils.h"
+#include "aoclsparse.h"
+#include <iostream>
+#include <chrono>
+#include <sys/time.h>
+#include <cassert>
 
+#define BATCH_SIZE 1
 
 
 //---------------------------------------------------------------------
@@ -262,17 +268,20 @@ void SpmvGold(
     ValueT                          alpha,
     ValueT                          beta)
 {
-    for (OffsetT row = 0; row < a.num_rows; ++row)
+    for (int batch_id = 0; batch_id < BATCH_SIZE; ++batch_id)
     {
-        ValueT partial = beta * vector_y_in[row];
-        for (
-            OffsetT offset = a.row_offsets[row];
-            offset < a.row_offsets[row + 1];
-            ++offset)
+        for (OffsetT row = 0; row < a.num_rows; ++row)
         {
-            partial += alpha * a.values[offset] * vector_x[a.column_indices[offset]];
+            ValueT partial = beta * vector_y_in[batch_id * a.num_rows + row];
+            for (
+                OffsetT offset = a.row_offsets[row];
+                offset < a.row_offsets[row + 1];
+                ++offset)
+            {
+                partial += alpha * a.values[batch_id * a.num_nonzeros + offset] * vector_x[batch_id * a.num_cols + a.column_indices[offset]];
+            }
+            vector_y_out[batch_id * a.num_rows + row] = partial;
         }
-        vector_y_out[row] = partial;
     }
 }
 
@@ -282,6 +291,7 @@ void SpmvGold(
 // CPU merge-based SpMV
 //---------------------------------------------------------------------
 
+#include "autogen_func.h"
 
 /**
  * OpenMP CPU merge-based SpMV
@@ -299,8 +309,10 @@ void OmpMergeCsrmv(
     ValueT*     __restrict        vector_y_out)
 {
     // Temporary storage for inter-thread fix-up after load-balanced work
-    OffsetT     row_carry_out[256];     // The last row-id each worked on by each thread when it finished its path segment
-    ValueT      value_carry_out[256];   // The running total within each thread when it finished its path segment
+    OffsetT     row_carry_out[256 * BATCH_SIZE];     // The last row-id each worked on by each thread when it finished its path segment
+    ValueT      value_carry_out[256 * BATCH_SIZE];   // The running total within each thread when it finished its path segment
+
+    assert(num_threads <= 256);
 
     #pragma omp parallel for schedule(static) num_threads(num_threads)
     for (int tid = 0; tid < num_threads; tid++)
@@ -320,35 +332,76 @@ void OmpMergeCsrmv(
         MergePathSearch(start_diagonal, row_end_offsets, nonzero_indices, a.num_rows, a.num_nonzeros, thread_coord);
         MergePathSearch(end_diagonal, row_end_offsets, nonzero_indices, a.num_rows, a.num_nonzeros, thread_coord_end);
 
-        // Consume whole rows
-        for (; thread_coord.x < thread_coord_end.x; ++thread_coord.x)
+        //TODO:insert batch part to scatter part, no need to keep all inter buffer but only keep partial buffer for each scatter k
+        //Current method: compute all batch op --> store in shared mem --> do scatter --> save partial sum to global mem --> fix up
+        //New method: compute batch op for a scatter k(k=0/1/.../scatter_batch_size-1) --> store in shared mem --> do scatter --> save partial sum to global mem --> fix up
+        //                          ^                                                                                                       |
+        //                          |                                                                                                       |
+        //                          ---------------------------------------------------------------------------------------------------------
+        //New method could save shared memory!
+        // which loop layer should we put batch dim in???
+        // ValueT* scatter_input_0  = (ValueT*) malloc(sizeof(ValueT) * (thread_coord_end.y - thread_coord.y) * BATCH_SIZE);
+        // int global_idx_bias = thread_coord.y;
+        // int item_number_for_thread = thread_coord_end.y - thread_coord.y;
+        // for (int batch_id = 0; batch_id < BATCH_SIZE; batch_id++)
+        // {
+        //     for (int global_idx = 0; global_idx < item_number_for_thread; ++global_idx)
+        //     {
+        //         scatter_input_0[batch_id * item_number_for_thread + global_idx] = values[batch_id * a.num_nonzeros + global_idx + global_idx_bias] * vector_x[batch_id * a.num_cols + column_indices[global_idx + global_idx_bias]];
+        //     }
+        // }
+
+
+        for (int batch_id = 0; batch_id < BATCH_SIZE; batch_id++)
         {
-            ValueT running_total = 0.0;
-            for (; thread_coord.y < row_end_offsets[thread_coord.x]; ++thread_coord.y)
+            // Consume whole rows
+            for (; thread_coord.x < thread_coord_end.x; ++thread_coord.x)
             {
-                running_total += values[thread_coord.y] * vector_x[column_indices[thread_coord.y]];
+                ValueT running_total = 0.0;
+                for (; thread_coord.y < row_end_offsets[thread_coord.x]; ++thread_coord.y)
+                {
+                    //TODO: insert all k dim loop here!!!! to avoid tmp buffer allocation
+                    int scatter_input_0[1] = {0};
+                    for (int batch_id = 0; batch_id < BATCH_SIZE/*another dim*/; batch_id++)
+                    {
+                        scatter_input_0[0] += values[batch_id * a.num_nonzeros + thread_coord.y] * vector_x[batch_id * a.num_cols + column_indices[thread_coord.y]];
+                    }
+                    // running_total += scatter_input_0[batch_id * item_number_for_thread + thread_coord.y - global_idx_bias];
+                    running_total += scatter_input_0[0];
+                }
+
+                vector_y_out[batch_id * a.num_rows + thread_coord.x] = running_total;
             }
 
-            vector_y_out[thread_coord.x] = running_total;
-        }
+            // Consume partial portion of thread's last row
+            ValueT running_total = 0.0;
+            for (; thread_coord.y < thread_coord_end.y; ++thread_coord.y)
+            {
+                int scatter_input_0[1] = {0};
+                for (int batch_id = 0; batch_id < BATCH_SIZE/*another dim*/; batch_id++)
+                {
+                    scatter_input_0[0] += values[batch_id * a.num_nonzeros + thread_coord.y] * vector_x[batch_id * a.num_cols + column_indices[thread_coord.y]];
+                }
+                running_total += scatter_input_0[0];
+            }
 
-        // Consume partial portion of thread's last row
-        ValueT running_total = 0.0;
-        for (; thread_coord.y < thread_coord_end.y; ++thread_coord.y)
-        {
-            running_total += values[thread_coord.y] * vector_x[column_indices[thread_coord.y]];
+            // Save carry-outs
+            row_carry_out[batch_id * 256 + tid] = thread_coord_end.x;
+            value_carry_out[batch_id * 256 + tid] = running_total;
+            // free(scatter_input_0);
         }
-
-        // Save carry-outs
-        row_carry_out[tid] = thread_coord_end.x;
-        value_carry_out[tid] = running_total;
     }
 
+    //there is an implicit sync
+
     // Carry-out fix-up (rows spanning multiple threads)
-    for (int tid = 0; tid < num_threads - 1; ++tid)
+    for (int batch_id = 0; batch_id < BATCH_SIZE; batch_id++)
     {
-        if (row_carry_out[tid] < a.num_rows)
-            vector_y_out[row_carry_out[tid]] += value_carry_out[tid];
+        for (int tid = 0; tid < num_threads - 1; ++tid)
+        {
+            if (row_carry_out[batch_id * 256 + tid] < a.num_rows)
+                vector_y_out[batch_id * a.num_nonzeros + row_carry_out[batch_id * 256 + tid]] += value_carry_out[batch_id * 256 + tid];
+        }
     }
 }
 
@@ -367,13 +420,13 @@ float TestOmpMergeCsrmv(
     int                             timing_iterations,
     float                           &setup_ms)
 {
-    setup_ms = 0.0;
 
     if (g_omp_threads == -1)
-        g_omp_threads = omp_get_num_procs();
+        g_omp_threads = omp_get_num_procs() * 2;
     int num_threads = g_omp_threads;
 
-    if (!g_quiet)
+    // if (!g_quiet)
+        printf("\ttiming_iterations: %d\n", timing_iterations);
         printf("\tUsing %d threads on %d procs\n", g_omp_threads, omp_get_num_procs());
 
     // Warmup/correctness
@@ -393,16 +446,24 @@ float TestOmpMergeCsrmv(
 
     // Timing
     float elapsed_ms = 0.0;
+    struct timeval t1,t2;
+    float timeuse;
+    gettimeofday(&t1,NULL);
     CpuTimer timer;
     timer.Start();
+    // auto start_time = std::chrono::high_resolution_clock::now();
     for(int it = 0; it < timing_iterations; ++it)
     {
         OmpMergeCsrmv(g_omp_threads, a, a.row_offsets + 1, a.column_indices, a.values, vector_x, vector_y_out);
     }
+    // auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time).count();
     timer.Stop();
-    elapsed_ms += timer.ElapsedMillis();
-
-    return elapsed_ms / timing_iterations;
+    // auto end_time = std::chrono::high_resolution_clock::now();
+    elapsed_ms = timer.ElapsedMillis();
+    gettimeofday(&t2,NULL);
+    timeuse = (t2.tv_sec - t1.tv_sec) * 1000.0 + (double)(t2.tv_usec - t1.tv_usec)/1000.0;
+    printf("timer1: %f, timer2: %f\n", elapsed_ms/ timing_iterations, timeuse/ timing_iterations);
+    return timeuse / timing_iterations;
 }
 
 
@@ -478,6 +539,9 @@ float TestMklCsrmv(
 
     // Timing
     float elapsed_ms = 0.0;
+    struct timeval t1,t2;
+    float timeuse;
+    gettimeofday(&t1,NULL);
     CpuTimer timer;
     timer.Start();
     for(int it = 0; it < timing_iterations; ++it)
@@ -486,8 +550,102 @@ float TestMklCsrmv(
     }
     timer.Stop();
     elapsed_ms += timer.ElapsedMillis();
+    gettimeofday(&t2,NULL);
+    timeuse = (t2.tv_sec - t1.tv_sec) * 1000.0 + (double)(t2.tv_usec - t1.tv_usec)/1000.0;
+    printf("timer1: %f, timer2: %f\n", elapsed_ms/ timing_iterations, timeuse/ timing_iterations);
+    return timeuse / timing_iterations;
+}
 
-    return elapsed_ms / timing_iterations;
+//---------------------------------------------------------------------
+// AMD-sparse CsrMV
+//---------------------------------------------------------------------
+
+/**
+ * Run AMD-sparse CsrMV
+ */
+template <
+    typename ValueT,
+    typename OffsetT>
+float TestAMDSparseCsrmv(
+    CsrMatrix<ValueT, OffsetT>&     a,
+    ValueT*                         vector_x,
+    ValueT*                         reference_vector_y_out,
+    ValueT*                         vector_y_out,
+    int                             timing_iterations,
+    float                           &setup_ms)
+{
+    memset(vector_y_out, -1, sizeof(ValueT) * a.num_rows);
+
+    aoclsparse_operation   trans     = aoclsparse_operation_none;
+
+    ValueT alpha = 1.0;
+    ValueT beta  = 0.0;
+
+
+    // Create matrix descriptor
+    aoclsparse_mat_descr descr;
+    // aoclsparse_create_mat_descr set aoclsparse_matrix_type to aoclsparse_matrix_type_general
+    // and aoclsparse_index_base to aoclsparse_index_base_zero.
+    aoclsparse_create_mat_descr(&descr);
+    aoclsparse_index_base base = aoclsparse_index_base_zero;
+
+    aoclsparse_matrix A;
+    aoclsparse_create_dcsr(A, base, a.num_rows, a.num_cols, a.num_nonzeros, a.row_offsets, a.column_indices, a.values);
+
+    //to identify hint id(which routine is to be executed, destroyed later)
+    aoclsparse_set_mv_hint(A, trans, descr, 1);
+
+    // Optimize the matrix, "A"
+    aoclsparse_optimize(A);
+
+    std::cout << "Invoking aoclsparse_dmv..";
+    //Invoke SPMV API (double precision)
+    aoclsparse_dmv(trans,
+	    &alpha,
+	    A,
+	    descr,
+	    vector_x,
+	    &beta,
+	    vector_y_out);
+    std::cout << "Done." << std::endl;
+
+    if (!g_quiet)
+    {
+        // Check answer
+        int compare = CompareResults(reference_vector_y_out, vector_y_out, a.num_rows, true);
+        printf("\t%s\n", compare ? "FAIL" : "PASS"); fflush(stdout);
+    }
+
+
+
+    // Timing
+    struct timeval t1,t2;
+    float timeuse;
+    gettimeofday(&t1,NULL);
+    CpuTimer timer;
+    timer.Start();
+    // auto start_time = std::chrono::high_resolution_clock::now();
+    for(int it = 0; it < timing_iterations; ++it)
+    {
+        aoclsparse_dmv(trans,
+            &alpha,
+            A,
+            descr,
+            vector_x,
+            &beta,
+            vector_y_out);
+    }
+    timer.Stop();
+    // auto end_time = std::chrono::high_resolution_clock::now();
+    float elapsed_ms = timer.ElapsedMillis();
+    // auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time).count();
+    gettimeofday(&t2,NULL);
+    timeuse = (t2.tv_sec - t1.tv_sec) * 1000.0 + (double)(t2.tv_usec - t1.tv_usec)/1000.0;
+    aoclsparse_destroy_mat_descr(descr);
+    aoclsparse_destroy(A);
+    printf("timer1: %f, timer2: %f\n", elapsed_ms/ timing_iterations, timeuse/ timing_iterations);
+
+    return timeuse / timing_iterations;
 }
 
 
@@ -617,29 +775,33 @@ void RunTests(
 
     // Allocate input and output vectors (if available, use NUMA allocation to force storage on the 
     // sockets for performance consistency)
-    ValueT *vector_x, *vector_y_in, *reference_vector_y_out, *vector_y_out;
-    if (csr_matrix.IsNumaMalloc())
-    {
-        vector_x                = (ValueT*) numa_alloc_onnode(sizeof(ValueT) * csr_matrix.num_cols, 0);
-        vector_y_in             = (ValueT*) numa_alloc_onnode(sizeof(ValueT) * csr_matrix.num_rows, 0);
-        reference_vector_y_out  = (ValueT*) numa_alloc_onnode(sizeof(ValueT) * csr_matrix.num_rows, 0);
-        vector_y_out            = (ValueT*) numa_alloc_onnode(sizeof(ValueT) * csr_matrix.num_rows, 0);
-    }
-    else
-    {
-        vector_x                = (ValueT*) mkl_malloc(sizeof(ValueT) * csr_matrix.num_cols, 4096);
-        vector_y_in             = (ValueT*) mkl_malloc(sizeof(ValueT) * csr_matrix.num_rows, 4096);
-        reference_vector_y_out  = (ValueT*) mkl_malloc(sizeof(ValueT) * csr_matrix.num_rows, 4096);
-        vector_y_out            = (ValueT*) mkl_malloc(sizeof(ValueT) * csr_matrix.num_rows, 4096);
-    }
+    ValueT *vector_x, *vector_y_in, *reference_vector_y_out, *vector_y_out, *matrix_val;
+    // if (csr_matrix.IsNumaMalloc())
+    // {
+        vector_x                = (ValueT*) malloc(sizeof(ValueT) * csr_matrix.num_cols * BATCH_SIZE);
+        vector_y_in             = (ValueT*) malloc(sizeof(ValueT) * csr_matrix.num_rows * BATCH_SIZE);
+        reference_vector_y_out  = (ValueT*) malloc(sizeof(ValueT) * csr_matrix.num_rows * BATCH_SIZE);
+        vector_y_out            = (ValueT*) malloc(sizeof(ValueT) * csr_matrix.num_rows * BATCH_SIZE);
+        matrix_val              = (ValueT*) malloc(sizeof(ValueT) * csr_matrix.num_nonzeros * BATCH_SIZE);
+    // }
+    // else
+    // {
+    //     vector_x                = (ValueT*) mkl_malloc(sizeof(ValueT) * csr_matrix.num_cols, 4096);
+    //     vector_y_in             = (ValueT*) mkl_malloc(sizeof(ValueT) * csr_matrix.num_rows, 4096);
+    //     reference_vector_y_out  = (ValueT*) mkl_malloc(sizeof(ValueT) * csr_matrix.num_rows, 4096);
+    //     vector_y_out            = (ValueT*) mkl_malloc(sizeof(ValueT) * csr_matrix.num_rows, 4096);
+    // }
 
-    for (int col = 0; col < csr_matrix.num_cols; ++col)
+    for (int col = 0; col < csr_matrix.num_cols * BATCH_SIZE; ++col)
         vector_x[col] = 1.0;
 
-    for (int row = 0; row < csr_matrix.num_rows; ++row)
+    for (int row = 0; row < csr_matrix.num_rows * BATCH_SIZE; ++row)
         vector_y_in[row] = 1.0;
 
+    for (int nnz = 0; nnz < csr_matrix.num_nonzeros * BATCH_SIZE; ++nnz)
+        matrix_val[nnz] = 1.0;
     // Compute reference answer
+    csr_matrix.values = matrix_val;
     SpmvGold(csr_matrix, vector_x, vector_y_in, reference_vector_y_out, alpha, beta);
 
     float avg_ms, setup_ms;
@@ -650,6 +812,12 @@ void RunTests(
     avg_ms = TestMklCsrmv(csr_matrix, vector_x, reference_vector_y_out, vector_y_out, timing_iterations, setup_ms);
     DisplayPerf(setup_ms, avg_ms, csr_matrix);
 
+    // // AMD-sparse SPMV
+    if (!g_quiet) printf("\n\n");
+    printf("AMD-sparse CsrMV, "); fflush(stdout);
+    avg_ms = TestAMDSparseCsrmv(csr_matrix, vector_x, reference_vector_y_out, vector_y_out, timing_iterations, setup_ms);
+    DisplayPerf(setup_ms, avg_ms, csr_matrix);
+
     // Merge SpMV
     if (!g_quiet) printf("\n\n");
     printf("Merge CsrMV, "); fflush(stdout);
@@ -657,24 +825,57 @@ void RunTests(
     DisplayPerf(setup_ms, avg_ms, csr_matrix);
 
     // Cleanup
-    if (csr_matrix.IsNumaMalloc())
-    {
-        if (vector_x)                   numa_free(vector_x, sizeof(ValueT) * csr_matrix.num_cols);
-        if (vector_y_in)                numa_free(vector_y_in, sizeof(ValueT) * csr_matrix.num_rows);
-        if (reference_vector_y_out)     numa_free(reference_vector_y_out, sizeof(ValueT) * csr_matrix.num_rows);
-        if (vector_y_out)               numa_free(vector_y_out, sizeof(ValueT) * csr_matrix.num_rows);
-    }
-    else
-    {
-        if (vector_x)                   mkl_free(vector_x);
-        if (vector_y_in)                mkl_free(vector_y_in);
-        if (reference_vector_y_out)     mkl_free(reference_vector_y_out);
-        if (vector_y_out)               mkl_free(vector_y_out);
-    }
+    // if (csr_matrix.IsNumaMalloc())
+    // {
+        if (vector_x)                   free(vector_x);//, sizeof(ValueT) * csr_matrix.num_cols);
+        if (vector_y_in)                free(vector_y_in);//, sizeof(ValueT) * csr_matrix.num_rows);
+        if (reference_vector_y_out)     free(reference_vector_y_out);//, sizeof(ValueT) * csr_matrix.num_rows);
+        if (vector_y_out)               free(vector_y_out);//, sizeof(ValueT) * csr_matrix.num_rows);
+    // }
+    // else
+    // {
+    //     if (vector_x)                   mkl_free(vector_x);
+    //     if (vector_y_in)                mkl_free(vector_y_in);
+    //     if (reference_vector_y_out)     mkl_free(reference_vector_y_out);
+    //     if (vector_y_out)               mkl_free(vector_y_out);
+    // }
 
 }
 
+// Reading... Parsing... (symmetric: 0, skew: 0, array: 0) done. /home/v-yinuoliu/yinuoliu/code/SparseCodegen/matrix2388.mtx, 
+//          num_rows: 1102824
+//          num_cols: 1102824
+//          num_nonzeros: 89306020
+//          row_length_mean: 80.97939
+//          row_length_std_dev: 36.55308
+//          row_length_variation: 0.45139
+//          row_length_skewness: 1.51276
 
+// CSR matrix (1102824 rows, 1102824 columns, 89306020 non-zeros, max-length 270):
+//         Degree 1e-1:    0 (0.00%)
+//         Degree 1e0:     18 (0.00%)
+//         Degree 1e1:     906510 (82.20%)
+//         Degree 1e2:     196296 (17.80%)
+
+
+
+
+// MKL CsrMV,      PASS
+// timer1: 706.594971, timer2: 31.929781
+// fp64: 0.0000 setup ms, 31.9298 avg ms, 5.59390 gflops, 56.353 effective GB/s
+
+
+// AMD-sparse CsrMV, Invoking aoclsparse_dmv..Done.
+//         PASS
+// timer1: 277.256409, timer2: 15.417477
+// fp64: 0.0000 setup ms, 15.4175 avg ms, 11.58504 gflops, 116.709 effective GB/s
+
+
+// Merge CsrMV,    timing_iterations: 1000
+//         Using 48 threads on 24 procs
+//         PASS
+// timer1: 285.510590, timer2: 14.996997
+// fp64: 0.0000 setup ms, 14.9970 avg ms, 11.90985 gflops, 119.981 effective GB/s
 
 /**
  * Main
@@ -708,7 +909,7 @@ int main(int argc, char **argv)
         exit(0);
     }
 
-    bool                fp32;
+    bool                fp32                = false;
     std::string         mtx_filename;
     int                 grid2d              = -1;
     int                 grid3d              = -1;
@@ -721,7 +922,7 @@ int main(int argc, char **argv)
     g_verbose = args.CheckCmdLineFlag("v");
     g_verbose2 = args.CheckCmdLineFlag("v2");
     g_quiet = args.CheckCmdLineFlag("quiet");
-    fp32 = args.CheckCmdLineFlag("fp32");
+    // fp32 = args.CheckCmdLineFlag("fp32");
     args.GetCmdLineArgument("i", timing_iterations);
     args.GetCmdLineArgument("mtx", mtx_filename);
     args.GetCmdLineArgument("grid2d", grid2d);
@@ -732,14 +933,14 @@ int main(int argc, char **argv)
     args.GetCmdLineArgument("threads", g_omp_threads);
 
     // Run test(s)
-    if (fp32)
-    {
-        RunTests<float, int>(alpha, beta, mtx_filename, grid2d, grid3d, wheel, dense, timing_iterations, args);
-    }
-    else
-    {
+    // if (fp32)
+    // {
+        // RunTests<float, int>(alpha, beta, mtx_filename, grid2d, grid3d, wheel, dense, timing_iterations, args);
+    // }
+    // else
+    // {
         RunTests<double, int>(alpha, beta, mtx_filename, grid2d, grid3d, wheel, dense, timing_iterations, args);
-    }
+    // }
 
     printf("\n");
 
