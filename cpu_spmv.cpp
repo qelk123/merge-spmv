@@ -281,6 +281,8 @@ void SpmvGold(
                 partial += alpha * a.values[batch_id * a.num_nonzeros + offset] * vector_x[batch_id * a.num_cols + a.column_indices[offset]];
             }
             vector_y_out[batch_id * a.num_rows + row] = partial;
+            // if(row>590 && row < 600)
+            //     std::cout<<"vector_y_out_ref["<< row <<"]:"<<partial<<"\n";
         }
     }
 }
@@ -308,9 +310,11 @@ void OmpMergeCsrmv(
     ValueT*     __restrict        vector_x,
     ValueT*     __restrict        vector_y_out)
 {
+    const int SCATTER_NUM = 1; 
     // Temporary storage for inter-thread fix-up after load-balanced work
-    OffsetT     row_carry_out[256 * BATCH_SIZE];     // The last row-id each worked on by each thread when it finished its path segment
-    ValueT      value_carry_out[256 * BATCH_SIZE];   // The running total within each thread when it finished its path segment
+    OffsetT     row_carry_out[SCATTER_NUM][256 * BATCH_SIZE];     // The last row-id each worked on by each thread when it finished its path segment
+    ValueT      value_carry_out[SCATTER_NUM][256 * BATCH_SIZE];   // The running total within each thread when it finished its path segment
+    ValueT* vector_y_out_list[SCATTER_NUM] = {vector_y_out};
 
     assert(num_threads <= 256);
 
@@ -332,13 +336,13 @@ void OmpMergeCsrmv(
         MergePathSearch(start_diagonal, row_end_offsets, nonzero_indices, a.num_rows, a.num_nonzeros, thread_coord);
         MergePathSearch(end_diagonal, row_end_offsets, nonzero_indices, a.num_rows, a.num_nonzeros, thread_coord_end);
 
-        //TODO:insert batch part to scatter part, no need to keep all inter buffer but only keep partial buffer for each scatter k
-        //Current method: compute all batch op --> store in shared mem --> do scatter --> save partial sum to global mem --> fix up
-        //New method: compute batch op for a scatter k(k=0/1/.../scatter_batch_size-1) --> store in shared mem --> do scatter --> save partial sum to global mem --> fix up
+        // TODO:insert batch part to scatter part, no need to keep all inter buffer but only keep partial buffer for each scatter k
+        // Current method: compute all batch op --> store in shared mem --> do scatter --> save partial sum to global mem --> fix up
+        // New method: compute batch op for a scatter k(k=0/1/.../scatter_batch_size-1) --> store in shared mem --> do scatter --> save partial sum to global mem --> fix up
         //                          ^                                                                                                       |
         //                          |                                                                                                       |
         //                          ---------------------------------------------------------------------------------------------------------
-        //New method could save shared memory!
+        // New method could save shared memory!
         // which loop layer should we put batch dim in???
         // ValueT* scatter_input_0  = (ValueT*) malloc(sizeof(ValueT) * (thread_coord_end.y - thread_coord.y) * BATCH_SIZE);
         // int global_idx_bias = thread_coord.y;
@@ -352,57 +356,108 @@ void OmpMergeCsrmv(
         // }
 
 
-        for (int batch_id = 0; batch_id < BATCH_SIZE; batch_id++)
-        {
+
             // Consume whole rows
             for (; thread_coord.x < thread_coord_end.x; ++thread_coord.x)
             {
-                ValueT running_total = 0.0;
-                for (; thread_coord.y < row_end_offsets[thread_coord.x]; ++thread_coord.y)
+                // ValueT running_total = 0.0;
+                //different running_total_{i}[batch_idx] = {0.0}; scatter在batch上的循环一定是在scatter_num循环的内部的
+                const int SCATTER_NUM = 1; 
+                const int BATCH_SIZE_LIST[SCATTER_NUM] = {BATCH_SIZE};
+                ValueT running_total_0[BATCH_SIZE] = {0.0};
+                ValueT* running_total[SCATTER_NUM] = {running_total_0};
+                for (; thread_coord.y < row_end_offsets[thread_coord.x]; ++thread_coord.y) //关键在于把ne的维度外提
+                //不像GPU，我们没有这么一大块内存保存tile_item的所有中间变量，我们只能提到外层循环，保证从global读然后写回global
                 {
+                    int idx_global = thread_coord.y;
                     //TODO: insert all k dim loop here!!!! to avoid tmp buffer allocation
-                    int scatter_input_0[1] = {0};
-                    for (int batch_id = 0; batch_id < BATCH_SIZE/*another dim*/; batch_id++)
+                    ValueT scatter_input_0[BATCH_SIZE] = {0};
+                    //batch op到scatter op之间的intermediate buffer应当放在scatter op的batch loop之外,从而支持对多个不同batch size的scatter的执行
+                    for (int batch_id_o = 0; batch_id_o < BATCH_SIZE; batch_id_o++)
                     {
-                        scatter_input_0[0] += values[batch_id * a.num_nonzeros + thread_coord.y] * vector_x[batch_id * a.num_cols + column_indices[thread_coord.y]];
+                        for (int batch_id = 0; batch_id < BATCH_SIZE/*another dim*/; batch_id++)
+                        {
+                            scatter_input_0[batch_id_o] += values[batch_id * a.num_nonzeros + idx_global] * vector_x[batch_id * a.num_cols + column_indices[idx_global]];
+                        }
                     }
+                    //prepare scatter_input_buffer_list
+                    //call compute_before_scatter_auto_gen()
+                    //for scatter_num, batch_idx
+                    for (int scatter_idx = 0; scatter_idx < SCATTER_NUM; ++scatter_idx) {
+                        for (int batch_id = 0; batch_id < BATCH_SIZE_LIST[scatter_idx]; batch_id++)
+                            running_total[scatter_idx][batch_id] += scatter_input_0[batch_id];
+                    }
+                    
+                    
                     // running_total += scatter_input_0[batch_id * item_number_for_thread + thread_coord.y - global_idx_bias];
-                    running_total += scatter_input_0[0];
+                    // running_total += scatter_input_0[0];
                 }
 
-                vector_y_out[batch_id * a.num_rows + thread_coord.x] = running_total;
+                for (int scatter_idx = 0; scatter_idx < SCATTER_NUM; ++scatter_idx) {
+                    for (int batch_id = 0; batch_id < BATCH_SIZE_LIST[scatter_idx]; batch_id++)
+                        vector_y_out_list[scatter_idx][batch_id * a.num_rows + thread_coord.x] = running_total[scatter_idx][batch_id];
+                }
+                // for scatter_num, batch_idx
+                // vector_y_out_list[scatter_num_idx][batch_id * a.num_rows + thread_coord.x] = running_total[scatter_num_idx][batch_idx]
+
+                // vector_y_out[batch_id * a.num_rows + thread_coord.x] = running_total;
             }
 
             // Consume partial portion of thread's last row
-            ValueT running_total = 0.0;
-            for (; thread_coord.y < thread_coord_end.y; ++thread_coord.y)
-            {
-                int scatter_input_0[1] = {0};
-                for (int batch_id = 0; batch_id < BATCH_SIZE/*another dim*/; batch_id++)
+            for (int batch_id = 0; batch_id < BATCH_SIZE/*another dim*/; batch_id++) {
+                const int SCATTER_NUM = 1; 
+                const int BATCH_SIZE_LIST[SCATTER_NUM] = {BATCH_SIZE}; //必须每一个loop有一份重复的，为了使能编译器进行优化！
+                ValueT running_total_0[BATCH_SIZE] = {0.0};
+                ValueT* running_total[SCATTER_NUM] = {running_total_0};
+                for (; thread_coord.y < thread_coord_end.y; ++thread_coord.y)
                 {
-                    scatter_input_0[0] += values[batch_id * a.num_nonzeros + thread_coord.y] * vector_x[batch_id * a.num_cols + column_indices[thread_coord.y]];
+                    int idx_global = thread_coord.y;
+                    ValueT scatter_input_0[BATCH_SIZE] = {0};
+                    for (int batch_id_o = 0; batch_id_o < BATCH_SIZE; batch_id_o++)
+                    {
+                        for (int batch_id = 0; batch_id < BATCH_SIZE/*another dim*/; batch_id++)
+                        {
+                            scatter_input_0[batch_id_o] += values[batch_id * a.num_nonzeros + idx_global] * vector_x[batch_id * a.num_cols + column_indices[idx_global]];
+                        }
+                    }
+                    for (int scatter_idx = 0; scatter_idx < SCATTER_NUM; ++scatter_idx) {
+                        for (int batch_id = 0; batch_id < BATCH_SIZE_LIST[scatter_idx]; batch_id++)
+                            running_total[scatter_idx][batch_id] += scatter_input_0[batch_id];
+                    }
                 }
-                running_total += scatter_input_0[0];
-            }
 
-            // Save carry-outs
-            row_carry_out[batch_id * 256 + tid] = thread_coord_end.x;
-            value_carry_out[batch_id * 256 + tid] = running_total;
-            // free(scatter_input_0);
-        }
+                // Save carry-outs
+                for (int scatter_idx = 0; scatter_idx < SCATTER_NUM; ++scatter_idx) {
+                    for (int batch_id = 0; batch_id < BATCH_SIZE_LIST[scatter_idx]; batch_id++) {
+                        row_carry_out[scatter_idx][batch_id * 256 + tid] = thread_coord_end.x;
+                        value_carry_out[scatter_idx][batch_id * 256 + tid] = running_total[scatter_idx][batch_id];
+                    }
+                }
+                // free(scatter_input_0);
+            }
+        
     }
 
     //there is an implicit sync
 
     // Carry-out fix-up (rows spanning multiple threads)
-    for (int batch_id = 0; batch_id < BATCH_SIZE; batch_id++)
+    for (int tid = 0; tid < num_threads - 1; ++tid)
     {
-        for (int tid = 0; tid < num_threads - 1; ++tid)
+        const int SCATTER_NUM = 1; 
+        const int BATCH_SIZE_LIST[SCATTER_NUM] = {BATCH_SIZE};
+        for (int scatter_idx = 0; scatter_idx < SCATTER_NUM; ++scatter_idx) {
+        for (int batch_id = 0; batch_id < BATCH_SIZE_LIST[scatter_idx]; batch_id++) 
         {
-            if (row_carry_out[batch_id * 256 + tid] < a.num_rows)
-                vector_y_out[batch_id * a.num_nonzeros + row_carry_out[batch_id * 256 + tid]] += value_carry_out[batch_id * 256 + tid];
+            if (row_carry_out[scatter_idx][batch_id * 256 + tid] < a.num_rows) {
+                vector_y_out_list[scatter_idx][batch_id * a.num_nonzeros + row_carry_out[scatter_idx][batch_id * 256 + tid]] += value_carry_out[scatter_idx][batch_id * 256 + tid];
+                // std::cout<<"fixup["<<row_carry_out[scatter_idx][batch_id * 256 + tid]<<"]:"<<value_carry_out[scatter_idx][batch_id * 256 + tid]<<"\n";
+            }
+        }
         }
     }
+    // for (int row =590; row < 600; ++row) {
+    //     std::cout<<"real["<<row<<"]:"<<vector_y_out_list[0][row]<<"\n";
+    // }
 }
 
 
@@ -793,30 +848,30 @@ void RunTests(
     // }
 
     for (int col = 0; col < csr_matrix.num_cols * BATCH_SIZE; ++col)
-        vector_x[col] = 1.0;
+        vector_x[col] = (double)(rand()%100)/10;
 
     for (int row = 0; row < csr_matrix.num_rows * BATCH_SIZE; ++row)
-        vector_y_in[row] = 1.0;
+        vector_y_in[row] = rand()%10;
 
     for (int nnz = 0; nnz < csr_matrix.num_nonzeros * BATCH_SIZE; ++nnz)
-        matrix_val[nnz] = 1.0;
+        matrix_val[nnz] = rand()%10;
     // Compute reference answer
     csr_matrix.values = matrix_val;
     SpmvGold(csr_matrix, vector_x, vector_y_in, reference_vector_y_out, alpha, beta);
 
     float avg_ms, setup_ms;
 
-    // MKL SpMV
-    if (!g_quiet) printf("\n\n");
-    printf("MKL CsrMV, "); fflush(stdout);
-    avg_ms = TestMklCsrmv(csr_matrix, vector_x, reference_vector_y_out, vector_y_out, timing_iterations, setup_ms);
-    DisplayPerf(setup_ms, avg_ms, csr_matrix);
+    // // MKL SpMV
+    // if (!g_quiet) printf("\n\n");
+    // printf("MKL CsrMV, "); fflush(stdout);
+    // avg_ms = TestMklCsrmv(csr_matrix, vector_x, reference_vector_y_out, vector_y_out, timing_iterations, setup_ms);
+    // DisplayPerf(setup_ms, avg_ms, csr_matrix);
 
-    // // AMD-sparse SPMV
-    if (!g_quiet) printf("\n\n");
-    printf("AMD-sparse CsrMV, "); fflush(stdout);
-    avg_ms = TestAMDSparseCsrmv(csr_matrix, vector_x, reference_vector_y_out, vector_y_out, timing_iterations, setup_ms);
-    DisplayPerf(setup_ms, avg_ms, csr_matrix);
+    // // // AMD-sparse SPMV
+    // if (!g_quiet) printf("\n\n");
+    // printf("AMD-sparse CsrMV, "); fflush(stdout);
+    // avg_ms = TestAMDSparseCsrmv(csr_matrix, vector_x, reference_vector_y_out, vector_y_out, timing_iterations, setup_ms);
+    // DisplayPerf(setup_ms, avg_ms, csr_matrix);
 
     // Merge SpMV
     if (!g_quiet) printf("\n\n");
